@@ -1,5 +1,5 @@
 
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
@@ -17,6 +17,12 @@ RUN python -m pip install --upgrade pip
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir \
+    --force-reinstall \
+    torch==2.7.1 \
+    torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 COPY handler.py .
 
