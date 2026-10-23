@@ -1,8 +1,4 @@
 
+chatterbox-tts
 runpod
-transformers
-accelerate
-safetensors
-huggingface_hub
 soundfile
-librosa
