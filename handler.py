@@ -25,7 +25,6 @@ def load_model():
                 print("Loading Chatterbox multilingual V3...")
                 MODEL = ChatterboxMultilingualTTS.from_pretrained(
                     device="cuda",
-                    t3_model="v3",
                 )
                 print("Chatterbox model loaded.")
 
