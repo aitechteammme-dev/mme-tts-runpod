@@ -1,4 +1,5 @@
-
 git+https://github.com/resemble-ai/chatterbox.git
 runpod
 soundfile
+numpy
+huggingface_hub
