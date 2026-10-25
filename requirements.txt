@@ -3,3 +3,4 @@ runpod
 soundfile
 numpy
 huggingface_hub
+scipy>=1.11
