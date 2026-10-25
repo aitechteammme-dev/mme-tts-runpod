@@ -1,12 +1,12 @@
-name: Build and Publish Chatterbox TTS (v3 tag only)
+name: Build TTS v4 test image
 
-# ONLY if you push to main: replace .github/workflows/build-image.yml with THIS file (and do NOT add build-image-v3-test.yml).
-# It is your existing workflow with one change: the tags. A push to main now builds and pushes ONLY :v3.
-# :latest and :v2 are not touched, so the live endpoint keeps running the old image until you move it yourself.
+# Keep the file name .github/workflows/build-image-v3-test.yml in the TTS worker repo (branch `tts-v3` ONLY) and replace its content with this.
+# It is a SEPARATE workflow from "Build and Publish Chatterbox TTS" (which pushes :latest and :v2 on every push to main and is left untouched).
+# This one runs only for pushes to the branch tts-v3 (or by hand) and pushes ONLY the tag :v4, so :latest, :v2 and the broken :v3 cannot change.
 on:
   push:
     branches:
-      - main
+      - tts-v3
   workflow_dispatch:
 
 permissions:
@@ -31,10 +31,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image (tag v3 only)
+      - name: Build and push image (tag v4 only)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/aitechteammme-dev/mme-tts-runpod:v3
+            ghcr.io/aitechteammme-dev/mme-tts-runpod:v4
