@@ -17,6 +17,7 @@ import base64
 import contextlib
 import copy
 import glob
+import inspect
 import io
 import os
 import sys
@@ -59,6 +60,24 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------------------------------------- model and voices
+def load_kwargs(from_pretrained, env):
+    """The arguments for `from_pretrained`: `t3_model` (env T3_MODEL, default "v3") is passed ONLY when the installed Chatterbox names that parameter.
+    Returns (kwargs, label for the log line, warning text or None)."""
+    want = env.get("T3_MODEL", "v3")
+    try:
+        params = inspect.signature(from_pretrained).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "t3_model" in params:
+        return {"device": "cuda", "t3_model": want}, want, None
+    return ({"device": "cuda"}, "not-supported",
+            f"WARNING: this Chatterbox version's from_pretrained has no t3_model parameter: T3_MODEL={want!r} is ignored (the library default model is used)")
+
+
+def loaded_line(seconds: float, t3_label: str) -> str:
+    return f"[TTS] model loaded in {seconds:.2f}s (t3_model={t3_label})"
+
+
 def load_model():
     """Load the model ONCE at start-up (never inside a request). Needs a CUDA GPU."""
     global MODEL, _torch
@@ -68,10 +87,24 @@ def load_model():
         raise RuntimeError("CUDA GPU is not available")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    kwargs, t3_label, warning = load_kwargs(ChatterboxMultilingualTTS.from_pretrained, os.environ)
+    if warning:
+        log(f"[TTS] {warning}")
     t = time.perf_counter()
-    MODEL = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
+    MODEL = ChatterboxMultilingualTTS.from_pretrained(**kwargs)
     _torch = torch
-    log(f"[TTS] model loaded in {time.perf_counter() - t:.2f}s")
+    log(loaded_line(time.perf_counter() - t, t3_label))
+
+
+def _clone_conds(conds):
+    """A copy of a prepared voice that the model may change without touching the stored one. SHALLOW on purpose: Chatterbox's conditionals hold tensors that
+    are results of computations (not leaves), and PyTorch refuses to deep-copy those ("Only Tensors created explicitly by the user (graph leaves) support the
+    deepcopy protocol"); that error crashed every worker at start-up in the first v3 image. generate() REBINDS `conds.t3` when the exaggeration differs (never
+    edits the tensors) and S3Gen converts the entries of `conds.gen` in place: so the object and the small `gen` dict are copied, the tensors are shared."""
+    c = copy.copy(conds)
+    if isinstance(getattr(c, "gen", None), dict):
+        c.gen = dict(c.gen)
+    return c
 
 
 def prepare_voice(name: str, wav_path: str) -> float:
@@ -81,7 +114,7 @@ def prepare_voice(name: str, wav_path: str) -> float:
     conds = getattr(MODEL, "conds", None)
     if conds is None:   # fail at start-up, loudly, instead of serving the wrong voice
         raise RuntimeError("the model has no .conds after prepare_conditionals(): this Chatterbox version cannot cache voices by name")
-    VOICES[name] = copy.deepcopy(conds)
+    VOICES[name] = _clone_conds(conds)
     return time.perf_counter() - t0
 
 
@@ -89,7 +122,7 @@ def select_voice(name: str) -> None:
     """Make `name` the active voice. A dictionary lookup: no audio is read and nothing is prepared. Call inside GEN_LOCK."""
     global _active_voice
     if name != _active_voice:
-        MODEL.conds = copy.deepcopy(VOICES[name])
+        MODEL.conds = _clone_conds(VOICES[name])
         _active_voice = name
 
 
@@ -253,21 +286,37 @@ def run_self_test() -> int:
         results.append(bool(ok))
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail and not ok else ""), flush=True)
 
+    class GraphConds:
+        """Stands in for Chatterbox's Conditionals: its tensors are results of computations (graph tensors) and PyTorch refuses to deep-copy them."""
+
+        def __init__(self, amp):
+            self.t3, self.gen = ("t3", amp), {"amp": amp}
+
+        def __deepcopy__(self, memo):
+            raise RuntimeError("Only Tensors created explicitly by the user (graph leaves) support the deepcopy protocol at the moment")
+
     class FakeModel:
         sr = 24000
 
-        def __init__(self):
-            self.conds, self.prepares = None, []
+        def __init__(self, graph=False):
+            self.conds, self.prepares, self.graph = None, [], graph
 
         def prepare_conditionals(self, path):
             data, _ = sf.read(path, dtype="float32")
             self.prepares.append(os.path.basename(path))
-            self.conds = {"amp": float(np.abs(data).max())}      # the "voice" of the fake model is its loudness
+            amp = float(np.abs(data).max())                      # the "voice" of the fake model is its loudness
+            self.conds = GraphConds(amp) if self.graph else {"amp": amp}
 
         def generate(self, text, language_id="hi", **kw):
+            c = self.conds
+            amp = c["amp"] if isinstance(c, dict) else c.gen["amp"]
+            if not isinstance(c, dict):
+                c.gen["_touched"] = True                         # S3Gen converts the entries of the reference dict in place
+                if "exaggeration" in kw:
+                    c.t3 = ("t3-exaggeration", kw["exaggeration"])   # generate() REBINDS conds.t3 when the exaggeration differs
             n = int(self.sr * 0.1 * max(1, len(text.split())))
             t = np.arange(n) / self.sr
-            return (self.conds["amp"] * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
+            return (amp * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
 
     def ulaw_ref(v):   # the Sun reference algorithm, one sample, plain Python
         seg_end = (0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF)
@@ -379,6 +428,38 @@ def run_self_test() -> int:
               ul["format"] == "ulaw8k" and ul["sample_rate"] == 8000 and len(base64.b64decode(ul["audio_base64"])) == n // 3, str((len(base64.b64decode(ul["audio_base64"])), n // 3)))
         check("response fields", set(ul) == {"audio_base64", "format", "sample_rate", "language", "voice", "timing"} and
               set(ul["timing"]) == {"generate_s", "total_s", "audio_s"})
+
+        # --- 5. the voice object of the REAL model refuses deepcopy (graph tensors): the voice cache must not depend on it. The first v3 image deep-copied it and
+        #        every worker crashed at start-up with "Only Tensors created explicitly by the user (graph leaves) support the deepcopy protocol".
+        try:
+            MODEL, VOICES, _active_voice = FakeModel(graph=True), {}, None
+            init_voices()
+            r1 = handler({"input": {**base, "voice": "utkarsh", "exaggeration": 0.9}})        # generate() rebinds .t3 on the ACTIVE copy
+            r2 = handler({"input": {**base, "voice": "priya"}})
+            r3 = handler({"input": {**base, "voice": "utkarsh"}})
+            stored = VOICES["utkarsh"]
+            check("real-like voice object that refuses deepcopy: both voices prepare at start-up and every request is answered",
+                  all("error" not in r for r in (r1, r2, r3)) and abs(peak(r1) - 0.2) < 0.02 and abs(peak(r2) - 0.6) < 0.02 and abs(peak(r3) - 0.2) < 0.02)
+            check("a request that changes the exaggeration does not alter the stored voice, nor the next request's voice",
+                  stored.t3[0] == "t3" and MODEL.conds.t3[0] == "t3", str((stored.t3, MODEL.conds.t3)))
+            check("the stored voice's reference dict is not shared with the active copy", "_touched" not in stored.gen and "_touched" in MODEL.conds.gen)
+        except Exception as e:                                                                  # noqa: BLE001: a crash IS the failure this case exists to catch
+            check("real-like voice object that refuses deepcopy: start-up and requests work", False, f"{type(e).__name__}: {str(e)[:110]}")
+
+    # --- 6. load_model(): t3_model is passed only when from_pretrained names it
+    def fp_new(device, t3_model=None):
+        return None
+
+    def fp_old(device):
+        return None
+    kw, label, warn = load_kwargs(fp_new, {})
+    check("load_model: t3_model is passed (default v3) when from_pretrained names it", kw == {"device": "cuda", "t3_model": "v3"} and label == "v3" and warn is None, str((kw, label, warn)))
+    kw, label, warn = load_kwargs(fp_new, {"T3_MODEL": "t3_mtl23ls_v3"})
+    check("load_model: the environment variable T3_MODEL overrides it", kw.get("t3_model") == "t3_mtl23ls_v3" and label == "t3_mtl23ls_v3" and warn is None)
+    kw, label, warn = load_kwargs(fp_old, {"T3_MODEL": "v3"})
+    check("load_model: not passed, and a WARNING, when this Chatterbox has no t3_model parameter",
+          kw == {"device": "cuda"} and label == "not-supported" and warn is not None and warn.startswith("WARNING") and "T3_MODEL" in warn, str((kw, label, warn)))
+    check("load_model: the 'model loaded' line names the t3_model used", loaded_line(1.234, "v3") == "[TTS] model loaded in 1.23s (t3_model=v3)")
     ok = all(results)
     print(f"{sum(results)}/{len(results)} checks passed" + ("" if ok else "  -> FAILED"))
     return 0 if ok else 1
