@@ -1,5 +1,8 @@
-name: Build and Publish Chatterbox TTS
+name: Build and Publish Chatterbox TTS (v3 tag only)
 
+# ONLY if you push to main: replace .github/workflows/build-image.yml with THIS file (and do NOT add build-image-v3-test.yml).
+# It is your existing workflow with one change: the tags. A push to main now builds and pushes ONLY :v3.
+# :latest and :v2 are not touched, so the live endpoint keeps running the old image until you move it yourself.
 on:
   push:
     branches:
@@ -10,27 +13,13 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/aitechteammme-dev/mme-tts-runpod
-
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
-
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Check reference voice is present
-        run: |
-          test -f ref_voice.wav || { echo "ERROR: ref_voice.wav is missing from the repo root"; exit 1; }
-          ls -lh ref_voice.wav
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -42,15 +31,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push image (tag v3 only)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: linux/amd64
-          provenance: false
           tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/aitechteammme-dev/mme-tts-runpod:v3
