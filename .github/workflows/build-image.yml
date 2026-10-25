@@ -1,8 +1,7 @@
 name: Build TTS v4 test image
 
-# Keep the file name .github/workflows/build-image-v3-test.yml in the TTS worker repo (branch `tts-v3` ONLY) and replace its content with this.
-# It is a SEPARATE workflow from "Build and Publish Chatterbox TTS" (which pushes :latest and :v2 on every push to main and is left untouched).
-# This one runs only for pushes to the branch tts-v3 (or by hand) and pushes ONLY the tag :v4, so :latest, :v2 and the broken :v3 cannot change.
+# Runs ONLY for pushes to the branch tts-v3 (change the branch name below if yours differs), or by hand FROM that branch.
+# Pushes only two tags: :v4 and :v4-<commit>. It never touches :latest, :v2 or :v3.
 on:
   push:
     branches:
@@ -15,6 +14,8 @@ permissions:
 
 jobs:
   build:
+    # a manual run from any other branch (for example main) is skipped, so main code can never be published as :v4
+    if: github.ref == 'refs/heads/tts-v3'
     runs-on: ubuntu-latest
 
     steps:
@@ -31,10 +32,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image (tag v4 only)
+      - name: Build and push image (v4 tags only)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             ghcr.io/aitechteammme-dev/mme-tts-runpod:v4
+            ghcr.io/aitechteammme-dev/mme-tts-runpod:v4-${{ github.sha }}
