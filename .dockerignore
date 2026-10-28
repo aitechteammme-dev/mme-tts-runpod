@@ -1,0 +1,46 @@
+# Build context for the v4 image. The Dockerfile COPYs only: requirements.txt, requirements.lock, ci/conda_diagnostics.py, pinned/, ref_voice.wav, handler.py
+# (tests/test_dockerignore.py checks that none of them is ignored). Everything below is unnecessary for the build, or must never be sent to the daemon.
+
+# version control and CI definitions
+.git
+.gitignore
+.github
+
+# local caches, bytecode, virtual environments, scratch
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# credentials and local configuration (never part of an image)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+*.token
+.npmrc
+.pypirc
+.netrc
+.aws
+.ssh
+
+# not needed inside the image
+docs
+tests
+*.md
+ci/*
+!ci/conda_diagnostics.py

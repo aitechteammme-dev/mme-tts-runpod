@@ -17,7 +17,6 @@ import base64
 import contextlib
 import copy
 import glob
-import inspect
 import io
 import os
 import sys
@@ -31,6 +30,16 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
+# Both are read by libraries when THEY are first imported (huggingface_hub, spacy_pkuseg), so they are set here, before anything imports them. An explicit setting
+# from the environment is kept and then rejected by pinned.runtime.verify_tokenizer_assets if it would allow a download.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("PKUSEG_HOME", "/app/pkuseg")
+
+from pinned import pins
+from pinned import runtime as pinned_runtime
+
+# The verified checkpoint directory (baked by pinned/fetch_checkpoint.py at image build time).
+MODEL_DIR = os.getenv("MODEL_DIR", "/app/model")
 # Reference voice baked into the image. Override with env vars.
 DEFAULT_REF_WAV = os.getenv("DEFAULT_REF_WAV", "/app/ref_voice.wav")
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "utkarsh")          # the name of the voice made from DEFAULT_REF_WAV
@@ -60,40 +69,23 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------------------------------------- model and voices
-def load_kwargs(from_pretrained, env):
-    """The arguments for `from_pretrained`: `t3_model` (env T3_MODEL, default "v3") is passed ONLY when the installed Chatterbox names that parameter.
-    Returns (kwargs, label for the log line, warning text or None)."""
-    want = env.get("T3_MODEL", "v3")
-    try:
-        params = inspect.signature(from_pretrained).parameters
-    except (TypeError, ValueError):
-        params = {}
-    if "t3_model" in params:
-        return {"device": "cuda", "t3_model": want}, want, None
-    return ({"device": "cuda"}, "not-supported",
-            f"WARNING: this Chatterbox version's from_pretrained has no t3_model parameter: T3_MODEL={want!r} is ignored (the library default model is used)")
-
-
 def loaded_line(seconds: float, t3_label: str) -> str:
     return f"[TTS] model loaded in {seconds:.2f}s (t3_model={t3_label})"
 
 
 def load_model():
-    """Load the model ONCE at start-up (never inside a request). Needs a CUDA GPU."""
+    """Load the model ONCE at start-up (never inside a request). Needs a CUDA GPU. FAIL-CLOSED: the pinned Chatterbox source, the pinned checkpoint files (sha256) and the V3 T3
+    file are verified first (pinned/runtime.py); any mismatch raises and the worker does not start. There is no fallback to V2 or to an unpinned download."""
     global MODEL, _torch
     import torch
-    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is not available")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    kwargs, t3_label, warning = load_kwargs(ChatterboxMultilingualTTS.from_pretrained, os.environ)
-    if warning:
-        log(f"[TTS] {warning}")
     t = time.perf_counter()
-    MODEL = ChatterboxMultilingualTTS.from_pretrained(**kwargs)
+    MODEL = pinned_runtime.load_verified_model("cuda", MODEL_DIR, os.environ, log)
     _torch = torch
-    log(loaded_line(time.perf_counter() - t, t3_label))
+    log(loaded_line(time.perf_counter() - t, pins.T3_FILE))
 
 
 def _clone_conds(conds):
@@ -198,6 +190,12 @@ def handler(job):
         return {"ok": True}
 
     total_start = time.perf_counter()
+
+    # Streamed audio would not be watermarked (Perth is applied to the finished waveform only): refuse, emit no audio.
+    if data.get("stream"):
+        refusal = pinned_runtime.streaming_refusal()
+        if refusal:
+            return refusal
 
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -446,20 +444,29 @@ def run_self_test() -> int:
         except Exception as e:                                                                  # noqa: BLE001: a crash IS the failure this case exists to catch
             check("real-like voice object that refuses deepcopy: start-up and requests work", False, f"{type(e).__name__}: {str(e)[:110]}")
 
-    # --- 6. load_model(): t3_model is passed only when from_pretrained names it
-    def fp_new(device, t3_model=None):
-        return None
-
-    def fp_old(device):
-        return None
-    kw, label, warn = load_kwargs(fp_new, {})
-    check("load_model: t3_model is passed (default v3) when from_pretrained names it", kw == {"device": "cuda", "t3_model": "v3"} and label == "v3" and warn is None, str((kw, label, warn)))
-    kw, label, warn = load_kwargs(fp_new, {"T3_MODEL": "t3_mtl23ls_v3"})
-    check("load_model: the environment variable T3_MODEL overrides it", kw.get("t3_model") == "t3_mtl23ls_v3" and label == "t3_mtl23ls_v3" and warn is None)
-    kw, label, warn = load_kwargs(fp_old, {"T3_MODEL": "v3"})
-    check("load_model: not passed, and a WARNING, when this Chatterbox has no t3_model parameter",
-          kw == {"device": "cuda"} and label == "not-supported" and warn is not None and warn.startswith("WARNING") and "T3_MODEL" in warn, str((kw, label, warn)))
-    check("load_model: the 'model loaded' line names the t3_model used", loaded_line(1.234, "v3") == "[TTS] model loaded in 1.23s (t3_model=v3)")
+    # --- 6. fail-closed loading and the streaming refusal (the pinned-runtime checks themselves are exercised in tests/test_pinned_runtime.py)
+    check("load: the V3 T3 file is the pinned one and the V2 file is not", pins.T3_FILE == "t3_mtl23ls_v3.safetensors" and pins.T3_FILE in pins.CHECKPOINT_FILES
+          and pins.V2_T3_FILE not in pins.CHECKPOINT_FILES)
+    check("load: the checkpoint revision is a full commit hash, not a branch name", len(pins.CHECKPOINT_REVISION) == 40 and pins.CHECKPOINT_REVISION != "main")
+    check("load: the 'model loaded' line names the t3 file used", loaded_line(1.234, pins.T3_FILE) == "[TTS] model loaded in 1.23s (t3_model=t3_mtl23ls_v3.safetensors)")
+    try:
+        pinned_runtime.load_verified_model("cuda", "/nonexistent", {"T3_MODEL": "v2"}, lambda m: None)
+        check("load: T3_MODEL=v2 is refused", False, "no error")
+    except pinned_runtime.PinnedRuntimeError as e:
+        check("load: T3_MODEL=v2 is refused", "refused" in str(e), str(e))
+    check("streaming is disabled by a constant, not by an environment variable", pins.STREAMING_ALLOWED is False)
+    with tempfile.TemporaryDirectory() as d:
+        MODEL, _torch, VOICES, _active_voice = FakeModel(), None, {}, None
+        sf.write(os.path.join(d, "ref.wav"), 0.2 * np.sin(2 * np.pi * 200 * np.arange(8000) / 16000), 16000)
+        DEFAULT_REF_WAV = os.path.join(d, "ref.wav")
+        VOICES_DIR = os.path.join(d, "none")
+        log = lambda m: None   # noqa: E731
+        init_voices()
+        for flag in (True, 1, "true"):
+            r = handler({"input": {"text": "यह एक परीक्षण है", "language": "hi", "stream": flag}})
+            check(f"input.stream={flag!r} is refused and carries no audio", r.get("error") == "streaming_disabled" and "audio_base64" not in r, str(r))
+        r = handler({"input": {"text": "यह एक परीक्षण है", "language": "hi", "stream": False}})
+        check("input.stream=false still returns the full (watermark-path) waveform", "audio_base64" in r and "error" not in r)
     ok = all(results)
     print(f"{sum(results)}/{len(results)} checks passed" + ("" if ok else "  -> FAILED"))
     return 0 if ok else 1
