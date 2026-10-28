@@ -112,7 +112,8 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          # ci/run_tests.py APPENDS /pt to sys.path (PYTHONPATH would prepend it), so the locked runtime packages always win, and fails the run if anything but the tooling was imported from /pt.
+          # ci/run_tests.py resolves ONLY pytest, _pytest, pluggy, iniconfig and py from /pt (a finder at the front of sys.meta_path), because the conda base already contains other versions (pluggy 1.5.0).
+          # /pt is not on sys.path, so every other package, including the locked runtime, comes from the image as before; the run fails if any package came from the wrong place.
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e MME_TEST_MODEL_DIR=/app/model -e MME_TEST_PKUSEG_HOME=/app/pkuseg \

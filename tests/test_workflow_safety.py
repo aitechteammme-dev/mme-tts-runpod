@@ -128,6 +128,18 @@ def test_test_tooling_path_is_the_same_interpreter_mounted_read_only_and_never_p
     assert ".__version__" not in prep and ".__version__" not in tests
 
 
+def test_runner_gives_the_tooling_precedence_without_exposing_the_folder():
+    """REGRESSION (CI): a sys.path entry for /pt loses to the base image's site-packages (pluggy 1.5.0 won over the pinned 1.7.0). Precedence must come from a meta-path finder for the tooling names only."""
+    src = (ROOT / "ci" / "run_tests.py").read_text(encoding="utf-8")
+    code_lines = "\n".join(line for line in src.splitlines() if not line.strip().startswith("#"))
+    assert "sys.meta_path.insert(0" in code_lines
+    assert not re.search(r"sys\.path\.(append|insert)\(\s*TOOLING_DIR", code_lines) and "PYTHONPATH" not in code_lines
+    assert 'TOOLING_MODULES = {"pytest", "_pytest", "pluggy", "iniconfig", "py"}' in src                         # exactly the tooling names, nothing from the lock
+    lock = (ROOT / "requirements.lock").read_text(encoding="utf-8").lower()
+    for name in ("pytest", "_pytest", "pluggy", "iniconfig"):
+        assert f"\n{name}==" not in lock
+
+
 def test_test_requirements_are_pinned_hashed_and_cannot_replace_locked_packages():
     text = (ROOT / "ci" / "requirements-test.txt").read_text(encoding="utf-8")
     entries = re.split(r"\n(?=[A-Za-z0-9_.\-]+==)", text)[1:]
