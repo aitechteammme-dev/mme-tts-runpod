@@ -90,20 +90,33 @@ jobs:
             -v "$PWD":/work:ro -v "$RUNNER_TEMP/out":/out \
             "$IMAGE" python /work/ci/image_checks.py --out /out/image-checks.json 2>&1 | tee "$RUNNER_TEMP/out/image-checks.log"
 
+      # Test tooling (pytest, pluggy, iniconfig: pinned and hash-checked in ci/requirements-test.txt) is NOT in the image. It is installed by the image's own `python` into a runner folder by this one
+      # container that has network, with --no-deps (packaging and pygments come from the image's locked packages). The tests then run in a container with NO network that mounts the folder READ-ONLY at /pt.
+      - name: Prepare test tooling (the only network use after the build)
+        id: tooling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pt"
+          chmod 777 "$RUNNER_TEMP/pt"
+          docker run --rm --security-opt no-new-privileges -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt \
+            "$IMAGE" sh -c 'python -c "import sys; print(sys.executable, sys.version.split()[0])" && python -m pip install --no-input --disable-pip-version-check --no-cache-dir --no-deps --require-hashes --target /pt -r /work/ci/requirements-test.txt' 2>&1 | tee "$RUNNER_TEMP/out/test-tooling.log"
+          docker run --rm --network none -v "$RUNNER_TEMP/pt":/pt:ro \
+            "$IMAGE" python -c "import sys; sys.path.append('/pt'); import pytest, pluggy, iniconfig; print('test tooling importable:', pytest.__version__, pluggy.__version__, iniconfig.__version__, '| interpreter', sys.executable)" 2>&1 | tee -a "$RUNNER_TEMP/out/test-tooling.log"
+
       - name: Test suite inside the image (real baked assets, container has no network)
         id: tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.tooling.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          # pytest is test tooling only: it is installed into a host folder by a throw-away container that HAS network, then mounted into the container that has none.
-          mkdir -p "$RUNNER_TEMP/pt"
-          docker run --rm -v "$RUNNER_TEMP/pt":/pt "$IMAGE" python -m pip install --quiet --target /pt pytest==9.2.0
+          # ci/run_tests.py APPENDS /pt to sys.path (PYTHONPATH would prepend it), so the locked runtime packages always win, and fails the run if anything but the tooling was imported from /pt.
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
-            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/pt \
+            -e PYTHONDONTWRITEBYTECODE=1 \
             -e MME_TEST_MODEL_DIR=/app/model -e MME_TEST_PKUSEG_HOME=/app/pkuseg \
-            -v "$PWD":/work:ro -w /work \
-            "$IMAGE" sh -c 'python -m pytest tests -p no:cacheprovider -q -rs && python handler.py --self-test' 2>&1 | tee "$RUNNER_TEMP/out/pytest.log"
+            -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt:ro -w /work \
+            "$IMAGE" sh -c 'python ci/run_tests.py tests -p no:cacheprovider -q -rs && python handler.py --self-test' 2>&1 | tee "$RUNNER_TEMP/out/pytest.log"
 
       - name: Summary
         if: always()
@@ -112,7 +125,7 @@ jobs:
             echo "### V4 build-only check (nothing was pushed)"
             echo "- image tag (local to this runner only): \`$IMAGE\`"
             echo "- registry writes: none (no login, no push, \`contents: read\`)"
-            echo "- outcomes: build=${{ steps.build.outcome }} image-checks=${{ steps.image_checks.outcome }} tests=${{ steps.tests.outcome }} (an empty value means the step did not run)"
+            echo "- outcomes: build=${{ steps.build.outcome }} image-checks=${{ steps.image_checks.outcome }} test-tooling=${{ steps.tooling.outcome }} tests=${{ steps.tests.outcome }} (an empty value means the step did not run)"
             echo '```'
             tail -n 12 "$RUNNER_TEMP/out/image-checks.log" 2>/dev/null || echo "image checks did not run"
             tail -n 3 "$RUNNER_TEMP/out/pytest.log" 2>/dev/null || echo "tests did not run"

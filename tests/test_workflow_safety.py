@@ -20,6 +20,11 @@ def code(p):
     return yaml.safe_dump(load(p), width=10 ** 6)
 
 
+def docker_runs(shell: str) -> list[str]:
+    """Every `docker run ...` command, with backslash-continued lines joined into one."""
+    return re.findall(r"docker run[^\n]*", shell.replace("\\\n", " "))
+
+
 def triggers(wf):
     return wf.get("on", wf.get(True))          # PyYAML (YAML 1.1) reads the key `on` as the boolean True
 
@@ -80,8 +85,11 @@ def test_failures_are_never_masked_and_evidence_is_kept():
     build = next(s for s in steps if s.get("id") == "build")
     assert "if" not in build                                                            # default success(): skipped if the preflight failed
     by_name = {s["name"]: s for s in steps}
-    for name in ("Collect image evidence (pip freeze, pip check, docker history)", "Image checks (CPU only, container has no network)", "Test suite inside the image (real baked assets, container has no network)"):
-        assert by_name[name]["if"] == "${{ !cancelled() && steps.build.outcome == 'success' }}", name      # run whenever an image exists, independent of each other
+    built = "${{ !cancelled() && steps.build.outcome == 'success' }}"
+    for name in ("Collect image evidence (pip freeze, pip check, docker history)", "Image checks (CPU only, container has no network)", "Prepare test tooling (the only network use after the build)"):
+        assert by_name[name]["if"] == built, name                                        # run whenever an image exists, independent of each other
+    tests = by_name["Test suite inside the image (real baked assets, container has no network)"]
+    assert tests["if"] == "${{ !cancelled() && steps.build.outcome == 'success' && steps.tooling.outcome == 'success' }}"     # needs the tooling, but a tooling failure still fails the job
     assert by_name["Summary"]["if"] == "always()" and by_name["Remove the local image"]["if"] == "always()"
     upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
     assert upload["if"] == "always()" and upload["with"]["if-no-files-found"] == "warn"
@@ -91,10 +99,41 @@ def test_failures_are_never_masked_and_evidence_is_kept():
 
 def test_check_containers_have_no_network():
     text = "\n".join(s.get("run", "") for s in all_steps(load(BUILD_ONLY)))      # shell code only, comments of the YAML excluded
-    runs = [m.group(0) for m in re.finditer(r"docker run[^\n]*(\\\n[^\n]*)*", text)]
+    runs = docker_runs(text)
     with_net = [r for r in runs if "--network none" not in r]
-    assert len(runs) >= 5 and len(with_net) == 1 and "pip install --quiet --target /pt pytest==9.2.0" in with_net[0]      # only the test-tooling install has network
+    assert len(runs) >= 6 and len(with_net) == 1                                         # only the tooling installation has network
+    prep = with_net[0]
+    assert "--no-deps --require-hashes --target /pt -r /work/ci/requirements-test.txt" in prep and '-v "$PWD":/work:ro' in prep and "PYTHONPATH" not in prep
     assert "skip" not in text.lower().replace("skopeo", "")
+
+
+def test_test_tooling_path_is_the_same_interpreter_mounted_read_only_and_never_prepended():
+    wf = load(BUILD_ONLY)
+    def shell(s):      # the shell commands only: explanatory comment lines may mention the words asserted absent below
+        return "\n".join(line for line in s.splitlines() if not line.strip().startswith("#"))
+    steps = {s["name"]: shell(s["run"]) for s in all_steps(wf) if "run" in s}
+    prep = steps["Prepare test tooling (the only network use after the build)"]
+    tests = steps["Test suite inside the image (real baked assets, container has no network)"]
+    # the container that RUNS the tests must mount the very folder the tooling step filled (this was missing: PYTHONPATH pointed at an unmounted /pt), read-only
+    assert '-v "$RUNNER_TEMP/pt":/pt:ro' in tests and "ci/run_tests.py" in tests and "--network none" in tests
+    assert "PYTHONPATH" not in prep and "PYTHONPATH" not in tests and "python -m pytest" not in tests         # PYTHONPATH would PREPEND the tooling folder and could shadow locked packages
+    # both containers start the image's own `python` (conda's), so pip installs for the interpreter that runs the tests
+    assert '"$IMAGE" sh -c \'python -c' in prep and 'python -m pip install' in prep and '"$IMAGE" sh -c \'python ci/run_tests.py' in tests
+    assert "pytest==" not in prep                                                      # versions live only in the hash-checked requirements file
+    verify = [m for m in docker_runs(prep) if "--network none" in m]
+    assert len(verify) == 1 and ":/pt:ro" in verify[0] and "import pytest, pluggy, iniconfig" in verify[0]      # the tooling is proven importable before the tests start
+
+
+def test_test_requirements_are_pinned_hashed_and_cannot_replace_locked_packages():
+    text = (ROOT / "ci" / "requirements-test.txt").read_text(encoding="utf-8")
+    entries = re.split(r"\n(?=[A-Za-z0-9_.\-]+==)", text)[1:]
+    names = [e.split("==")[0].lower() for e in entries]
+    assert names == ["pytest", "pluggy", "iniconfig"]
+    assert all(re.search(r"--hash=sha256:[0-9a-f]{64}", e) for e in entries)
+    assert re.search(r"^pytest==9\.2\.0 ", text, re.M)
+    lock = {m.group(1).lower().replace("_", "-") for m in re.finditer(r"^([A-Za-z0-9_.\-]+)==", (ROOT / "requirements.lock").read_text(encoding="utf-8"), re.M)}
+    assert not set(names) & lock                                                       # nothing the image already locks is (re)installed by the tooling step
+    assert "pytest" not in lock and "pytest" not in (ROOT / "requirements.txt").read_text(encoding="utf-8")     # the image itself carries no test tooling
 
 
 def test_publishing_workflow_is_unchanged_in_scope():
