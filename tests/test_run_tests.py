@@ -61,6 +61,52 @@ def test_tooling_dir_is_appended_not_prepended(tmp_path, monkeypatch):
     sys.path.remove(str(tmp_path))
 
 
+def fake_tooling(tmp_path, versions=None, skip=()):
+    """A tooling folder like the one `pip install --target` makes, BUT whose packages define no __version__ (iniconfig 2.3.1 does not), with real-looking dist-info metadata."""
+    pins = rt.pinned_tooling()
+    versions = versions or pins
+    for dist, ver in versions.items():
+        if dist in skip:
+            continue
+        pkg = tmp_path / dist
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("# intentionally defines no version attribute\n", encoding="utf-8")
+        info = tmp_path / f"{dist}-{ver}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: {ver}\n", encoding="utf-8")
+    return tmp_path
+
+
+def run_check(folder):
+    # -S: no site-packages, like the image where pytest is not installed; the check must work with the tooling folder alone
+    return subprocess.run([sys.executable, "-S", str(ROOT / "ci" / "run_tests.py"), "--check-tooling"], env={"MME_TEST_TOOLING_DIR": str(folder), "PATH": ""}, capture_output=True, text=True)
+
+
+def test_check_tooling_passes_for_packages_that_define_no_version_attribute(tmp_path):
+    """REGRESSION: the workflow's first check printed `iniconfig.__version__` and crashed with AttributeError although the install had succeeded."""
+    folder = fake_tooling(tmp_path)
+    assert all("__version__" not in (folder / d / "__init__.py").read_text() for d in rt.pinned_tooling())
+    r = run_check(folder)
+    assert r.returncode == 0, r.stderr
+    pins = rt.pinned_tooling()
+    assert all(f"{d}=={v}" in r.stdout for d, v in pins.items())
+
+
+def test_check_tooling_rejects_a_wrong_missing_or_unmounted_tooling(tmp_path):
+    pins = rt.pinned_tooling()
+    (tmp_path / "w").mkdir()
+    r = run_check(fake_tooling(tmp_path / "w", {**pins, "pluggy": "0.0.1"}))
+    assert r.returncode == 1 and "pluggy: installed 0.0.1, pinned" in r.stderr
+    (tmp_path / "m").mkdir()
+    r = run_check(fake_tooling(tmp_path / "m", skip=("iniconfig",)))
+    assert r.returncode == 1 and "iniconfig" in r.stderr
+    assert run_check(tmp_path / "absent").returncode == 2
+
+
+def test_pinned_tooling_matches_the_requirements_file():
+    assert rt.pinned_tooling() == {"pytest": "9.2.0", "pluggy": "1.7.0", "iniconfig": "2.3.1"}
+
+
 def test_a_failing_pytest_run_stays_failing(tmp_path, monkeypatch):
     class FakePytest:
         __version__ = "0"

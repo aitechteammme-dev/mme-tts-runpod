@@ -121,7 +121,11 @@ def test_test_tooling_path_is_the_same_interpreter_mounted_read_only_and_never_p
     assert '"$IMAGE" sh -c \'python -c' in prep and 'python -m pip install' in prep and '"$IMAGE" sh -c \'python ci/run_tests.py' in tests
     assert "pytest==" not in prep                                                      # versions live only in the hash-checked requirements file
     verify = [m for m in docker_runs(prep) if "--network none" in m]
-    assert len(verify) == 1 and ":/pt:ro" in verify[0] and "import pytest, pluggy, iniconfig" in verify[0]      # the tooling is proven importable before the tests start
+    assert len(verify) == 1 and ":/pt:ro" in verify[0] and ":/work:ro" in verify[0] and "ci/run_tests.py --check-tooling" in verify[0]      # proven before the tests start
+    # REGRESSION (CI run 40671308987): the check read `iniconfig.__version__`, which iniconfig 2.3.1 does not define. Versions must come from package metadata, never from a module attribute.
+    for name in ("pytest", "pluggy", "iniconfig"):
+        assert f"{name}.__version__" not in prep and f"{name}.__version__" not in tests
+    assert ".__version__" not in prep and ".__version__" not in tests
 
 
 def test_test_requirements_are_pinned_hashed_and_cannot_replace_locked_packages():

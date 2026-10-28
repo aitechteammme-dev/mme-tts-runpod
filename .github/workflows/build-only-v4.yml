@@ -102,8 +102,9 @@ jobs:
           chmod 777 "$RUNNER_TEMP/pt"
           docker run --rm --security-opt no-new-privileges -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt \
             "$IMAGE" sh -c 'python -c "import sys; print(sys.executable, sys.version.split()[0])" && python -m pip install --no-input --disable-pip-version-check --no-cache-dir --no-deps --require-hashes --target /pt -r /work/ci/requirements-test.txt' 2>&1 | tee "$RUNNER_TEMP/out/test-tooling.log"
-          docker run --rm --network none -v "$RUNNER_TEMP/pt":/pt:ro \
-            "$IMAGE" python -c "import sys; sys.path.append('/pt'); import pytest, pluggy, iniconfig; print('test tooling importable:', pytest.__version__, pluggy.__version__, iniconfig.__version__, '| interpreter', sys.executable)" 2>&1 | tee -a "$RUNNER_TEMP/out/test-tooling.log"
+          # versions are read from the installed package metadata and compared with ci/requirements-test.txt (a module's own __version__ is not reliable: iniconfig 2.3.1 has none)
+          docker run --rm --network none -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt:ro \
+            "$IMAGE" python /work/ci/run_tests.py --check-tooling 2>&1 | tee -a "$RUNNER_TEMP/out/test-tooling.log"
 
       - name: Test suite inside the image (real baked assets, container has no network)
         id: tests
