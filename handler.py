@@ -18,6 +18,7 @@ import contextlib
 import copy
 import glob
 import io
+import json
 import os
 import sys
 import tempfile
@@ -138,11 +139,103 @@ def init_voices() -> None:
 
 def generate_audio(text, language, **gen_kwargs):
     if _torch is None:   # no torch (self-test): the model returns a numpy array
-        return np.atleast_1d(np.asarray(MODEL.generate(text, language_id=language, **gen_kwargs), dtype=np.float32))
+        t_gen = time.perf_counter()
+        wav = MODEL.generate(text, language_id=language, **gen_kwargs)
+        _P.rec("model_generate_s", time.perf_counter() - t_gen)
+        _P.rec("sync_and_host_copy_s", 0.0)
+        return np.atleast_1d(np.asarray(wav, dtype=np.float32))
+    t_gen = time.perf_counter()
     with _torch.inference_mode():
         wav = MODEL.generate(text, language_id=language, **gen_kwargs)
+    _P.rec("model_generate_s", time.perf_counter() - t_gen)
+    t_post = time.perf_counter()
     _torch.cuda.synchronize()
-    return np.atleast_1d(wav.detach().float().cpu().squeeze().numpy())
+    out = np.atleast_1d(wav.detach().float().cpu().squeeze().numpy())
+    _P.rec("sync_and_host_copy_s", time.perf_counter() - t_post)       # upstream generate() already returns a CPU tensor (it copies before the watermark), so this is expected to be ~0
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------- latency profiling (OFF unless V4_PROFILE=1)
+# Experimental branch only. With the variable unset every call below is a no-op and the response is byte-for-byte the baseline one. With V4_PROFILE=1 the response gains a `timing_detail` object
+# (seconds per stage + GPU / library / worker metadata); the audio is unchanged. The wrappers are installed AFTER the model was verified and warmed up, they call the real functions and return their results
+# untouched, and they add a CUDA synchronize at each boundary (so GPU stages are attributed correctly): profile numbers are therefore slightly higher than unprofiled ones. No credentials, audio or text are recorded.
+PROFILE = os.getenv("V4_PROFILE", "0") == "1"
+
+
+class _Profiler:
+    def __init__(self):
+        self.enabled = False
+        self.d = {}
+        self.meta = {}
+
+    def begin(self):
+        if self.enabled:
+            self.d = {}
+
+    def rec(self, key, seconds):
+        if self.enabled:
+            self.d[key] = self.d.get(key, 0.0) + float(seconds)
+
+    def count(self, key, n):
+        if self.enabled:
+            self.d[key] = n
+
+    def snapshot(self, total_s, extra):
+        if not self.enabled:
+            return None
+        d = dict(self.d)
+        parts = sum(d.get(k, 0.0) for k in ("tokenize_s", "t3_s", "flow_s", "hift_s", "watermark_s"))
+        if "model_generate_s" in d:
+            d["model_generate_other_s"] = max(0.0, d["model_generate_s"] - parts)
+        known = sum(d.get(k, 0.0) for k in ("validate_s", "lock_wait_s", "select_voice_s", "model_generate_s", "sync_and_host_copy_s", "encode_s"))
+        d["handler_unattributed_s"] = max(0.0, total_s - known)
+        if d.get("speech_tokens") and d.get("t3_s") is not None:
+            d["t3_ms_per_token"] = 1000.0 * d["t3_s"] / d["speech_tokens"]
+        out = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()}
+        out.update(self.meta)
+        out.update(extra)
+        return out
+
+
+_P = _Profiler()
+
+
+def install_profiling(model, torch_mod=None) -> bool:
+    """Wrap the stage functions of the loaded model with timers. Returns False (and changes nothing) if the model does not have the expected attributes."""
+    try:
+        targets = [(model.tokenizer, "text_to_tokens", "tokenize_s"), (model.t3, "inference", "t3_s"), (model.s3gen, "flow_inference", "flow_s"),
+                   (model.s3gen, "hift_inference", "hift_s"), (model.watermarker, "apply_watermark", "watermark_s")]
+        for obj, name, _ in targets:
+            if not callable(getattr(obj, name)):
+                raise AttributeError(name)
+    except AttributeError as exc:
+        log(f"[TTS_PROFILE] not installed: the model has no {exc}")
+        return False
+    cuda = torch_mod is not None and torch_mod.cuda.is_available()
+
+    def wrap(fn, key):
+        def timed(*args, **kwargs):
+            if cuda:
+                torch_mod.cuda.synchronize()
+            t = time.perf_counter()
+            out = fn(*args, **kwargs)
+            if cuda:
+                torch_mod.cuda.synchronize()
+            _P.rec(key, time.perf_counter() - t)
+            if key == "t3_s":
+                shape = getattr(out, "shape", None)
+                if shape is not None and len(shape) == 2:
+                    _P.count("speech_tokens", int(shape[1]))
+            return out
+        return timed
+    for obj, name, key in targets:
+        setattr(obj, name, wrap(getattr(obj, name), key))      # instance attribute: the class (and the pinned fingerprints) are not touched
+    meta = {"profile_mode": True, "python": sys.version.split()[0], "worker_id": os.getenv("RUNPOD_POD_ID", "unavailable"), "sample_rate": getattr(model, "sr", None)}
+    if cuda:
+        meta.update({"gpu": torch_mod.cuda.get_device_name(0), "torch": torch_mod.__version__, "cuda": torch_mod.version.cuda})
+    _P.meta, _P.enabled = meta, True
+    log("[TTS_PROFILE] installed: stage timers on tokenizer, T3, S3Gen flow, HiFT vocoder and the watermarker (CUDA-synchronized)")
+    return True
 
 
 def warm_up() -> None:
@@ -190,6 +283,7 @@ def handler(job):
         return {"ok": True}
 
     total_start = time.perf_counter()
+    _P.begin()
 
     # Streamed audio would not be watermarked (Perth is applied to the finished waveform only): refuse, emit no audio.
     if data.get("stream"):
@@ -222,8 +316,11 @@ def handler(job):
         if key in data:
             gen_kwargs[key] = float(data[key])
 
+    _P.rec("validate_s", time.perf_counter() - total_start)
     try:
+        t_before_lock = time.perf_counter()
         with GEN_LOCK:
+            _P.rec("lock_wait_s", time.perf_counter() - t_before_lock)
             ref_s = 0.0
             ref_b64 = data.get("reference_audio_base64") if ALLOW_REQUEST_REF else None
             if ref_b64:   # legacy path (off by default): a voice sent in the request is prepared on EVERY such request (slow)
@@ -235,7 +332,9 @@ def handler(job):
                     f.flush()
                     ref_s = prepare_voice("request", f.name)
                 voice = "request"
+            t_sel = time.perf_counter()
             select_voice(voice)   # by name: no reference audio is read or prepared per request
+            _P.rec("select_voice_s", time.perf_counter() - t_sel)
 
             t0 = time.perf_counter()
             audio = generate_audio(text, language, **gen_kwargs)
@@ -244,6 +343,7 @@ def handler(job):
         t0 = time.perf_counter()
         audio_b64 = encode_audio(audio, MODEL.sr, output_format)
         encode_s = time.perf_counter() - t0
+        _P.rec("encode_s", encode_s)
 
         audio_s = len(audio) / MODEL.sr
         total_s = time.perf_counter() - total_start
@@ -254,7 +354,7 @@ def handler(job):
             f"total_s={total_s:.3f} rtf={generate_s / max(audio_s, 1e-6):.2f} fmt={output_format}"
         )
 
-        return {
+        response = {
             "audio_base64": audio_b64,
             "format": output_format,
             "sample_rate": 8000 if output_format == "ulaw8k" else MODEL.sr,
@@ -266,6 +366,11 @@ def handler(job):
                 "audio_s": round(audio_s, 3),
             },
         }
+        detail = _P.snapshot(total_s, {"chars": len(text), "audio_s": round(audio_s, 3), "output_format": output_format, "response_base64_chars": len(audio_b64)})
+        if detail is not None:       # only with V4_PROFILE=1: an extra field, the audio and the baseline fields are unchanged
+            response["timing_detail"] = detail
+            log("[TTS_PROFILE] " + json.dumps(detail, sort_keys=True))
+        return response
 
     except Exception as exc:
         traceback.print_exc()
@@ -479,6 +584,8 @@ def main() -> int:
     load_model()
     init_voices()
     warm_up()
+    if PROFILE:    # after verification and warm-up, so the checked model is the one that gets wrapped, and the warm-up is not recorded
+        install_profiling(MODEL, _torch)
     log(f"[TTS] ready: voices={sorted(VOICES)} default={DEFAULT_VOICE} sample_rate={MODEL.sr} formats={','.join(OUTPUT_FORMATS)} "
         f"request_reference={'allowed' if ALLOW_REQUEST_REF else 'ignored'}")
     runpod.serverless.start({"handler": handler})
