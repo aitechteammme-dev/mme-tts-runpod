@@ -1,0 +1,148 @@
+name: V4 build-only check (never pushes)
+
+# BUILD-ONLY. This workflow cannot publish anything: it has no registry login, no `docker push`, no package-write permission and no secrets.
+# It builds the Dockerfile inside the runner under a throw-away LOCAL tag, runs CPU-only checks inside the built image (network disabled), uploads text logs as workflow artifacts, and exits.
+# It never touches any release tag (v4, v4-<sha>, latest, v2, v3 or any other), and it is independent of build-image.yml (the publishing workflow, which runs only for pushes to tts-v3).
+#
+# Triggers: a push to the branch tts-v4-streaming (docs-only pushes ignored), or a manual run (workflow_dispatch; GitHub lists a manual workflow only once the file exists on the default branch).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tts-v4-streaming
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+# Read-only. `packages: write` and every other write scope are deliberately absent.
+permissions:
+  contents: read
+
+concurrency:
+  group: v4-build-only-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: mme-tts-v4-buildcheck:run-${{ github.run_id }}-${{ github.run_attempt }}   # no registry host in the name: it can only exist in this runner's local Docker
+  MIN_FREE_GB: "35"                                                                   # free space required on the Docker data filesystem before building (the image is estimated at 20 GB, plus build cache)
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  build-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout (read-only, no stored credentials)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Preflight - free disk space and BuildKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          chmod 777 "$RUNNER_TEMP/out"      # the check containers run as root with all capabilities dropped (no DAC override) and must still be able to write their reports here
+          { echo "--- before cleanup"; df -h / /mnt; } | tee "$RUNNER_TEMP/out/disk.txt"
+          # preinstalled toolchains this job never uses; the runner is discarded afterwards
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune --all --force > /dev/null || true
+          root="$(docker info --format '{{.DockerRootDir}}')"
+          { echo "--- after cleanup (docker root: $root)"; df -h "$root"; } | tee -a "$RUNNER_TEMP/out/disk.txt"
+          free_gb="$(df -BG --output=avail "$root" | tail -1 | tr -dc '0-9')"
+          echo "free on the Docker data filesystem: ${free_gb} GB (need >= ${MIN_FREE_GB})"
+          if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+            echo "::error::only ${free_gb} GB free for Docker; the v4 image build needs about 20 GB plus cache (MIN_FREE_GB=${MIN_FREE_GB}). Stopping before the build."
+            exit 1
+          fi
+          docker version --format 'docker server {{.Server.Version}}'
+          docker buildx version
+
+      - name: Build the image locally (no push)
+        id: build
+        timeout-minutes: 50
+        run: |
+          set -euo pipefail
+          # The Dockerfile itself fails the build on: a base that is not Python 3.11, a lock hash mismatch, a checkpoint / Cangjie / pkuseg hash mismatch,
+          # a pinned-package or Chatterbox-source mismatch, and any tokenizer network attempt in its --network=none smoke test.
+          docker build --progress=plain --tag "$IMAGE" . 2>&1 | tee "$RUNNER_TEMP/out/build.log"
+          { echo "--- after build"; df -h /; docker system df; docker image ls "$IMAGE"; } | tee -a "$RUNNER_TEMP/out/disk.txt"
+
+      # Evidence collection and the two check steps below run whenever the image was BUILT, even if an earlier check failed, so one failure never hides the other results.
+      # None of them uses continue-on-error: a failing step still fails the job (tests/test_workflow_safety.py enforces that).
+      - name: Collect image evidence (pip freeze, pip check, docker history)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker run --rm --network none "$IMAGE" cat /app/pip-freeze.txt > "$RUNNER_TEMP/out/pip-freeze.txt"
+          docker run --rm --network none "$IMAGE" pip check > "$RUNNER_TEMP/out/pip-check.txt" 2>&1 || true      # informational: image_checks.py judges it
+          docker history --no-trunc "$IMAGE" > "$RUNNER_TEMP/out/docker-history.txt"
+
+      - name: Image checks (CPU only, container has no network)
+        id: image_checks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD":/work:ro -v "$RUNNER_TEMP/out":/out \
+            "$IMAGE" python /work/ci/image_checks.py --out /out/image-checks.json 2>&1 | tee "$RUNNER_TEMP/out/image-checks.log"
+
+      # Test tooling (pytest, pluggy, iniconfig: pinned and hash-checked in ci/requirements-test.txt) is NOT in the image. It is installed by the image's own `python` into a runner folder by this one
+      # container that has network, with --no-deps (packaging and pygments come from the image's locked packages). The tests then run in a container with NO network that mounts the folder READ-ONLY at /pt.
+      - name: Prepare test tooling (the only network use after the build)
+        id: tooling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pt"
+          chmod 777 "$RUNNER_TEMP/pt"
+          docker run --rm --security-opt no-new-privileges -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt \
+            "$IMAGE" sh -c 'python -c "import sys; print(sys.executable, sys.version.split()[0])" && python -m pip install --no-input --disable-pip-version-check --no-cache-dir --no-deps --require-hashes --target /pt -r /work/ci/requirements-test.txt' 2>&1 | tee "$RUNNER_TEMP/out/test-tooling.log"
+          # versions are read from the installed package metadata and compared with ci/requirements-test.txt (a module's own __version__ is not reliable: iniconfig 2.3.1 has none)
+          docker run --rm --network none -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt:ro \
+            "$IMAGE" python /work/ci/run_tests.py --check-tooling 2>&1 | tee -a "$RUNNER_TEMP/out/test-tooling.log"
+
+      - name: Test suite inside the image (real baked assets, container has no network)
+        id: tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.tooling.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # ci/run_tests.py resolves ONLY pytest, _pytest, pluggy, iniconfig and py from /pt (a finder at the front of sys.meta_path), because the conda base already contains other versions (pluggy 1.5.0).
+          # /pt is not on sys.path, so every other package, including the locked runtime, comes from the image as before; the run fails if any package came from the wrong place.
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e MME_TEST_MODEL_DIR=/app/model -e MME_TEST_PKUSEG_HOME=/app/pkuseg \
+            -v "$PWD":/work:ro -v "$RUNNER_TEMP/pt":/pt:ro -w /work \
+            "$IMAGE" sh -c 'python ci/run_tests.py tests -p no:cacheprovider -q -rs && python handler.py --self-test' 2>&1 | tee "$RUNNER_TEMP/out/pytest.log"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### V4 build-only check (nothing was pushed)"
+            echo "- image tag (local to this runner only): \`$IMAGE\`"
+            echo "- registry writes: none (no login, no push, \`contents: read\`)"
+            echo "- outcomes: build=${{ steps.build.outcome }} image-checks=${{ steps.image_checks.outcome }} test-tooling=${{ steps.tooling.outcome }} tests=${{ steps.tests.outcome }} (an empty value means the step did not run)"
+            echo '```'
+            tail -n 12 "$RUNNER_TEMP/out/image-checks.log" 2>/dev/null || echo "image checks did not run"
+            tail -n 3 "$RUNNER_TEMP/out/pytest.log" 2>/dev/null || echo "tests did not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload text logs (workflow artifact, not a registry)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: v4-build-only-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Remove the local image
+        if: always()
+        run: docker image rm --force "$IMAGE" || true

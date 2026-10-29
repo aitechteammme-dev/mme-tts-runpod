@@ -1,6 +1,15 @@
-git+https://github.com/resemble-ai/chatterbox.git
-runpod
-soundfile
-numpy
-huggingface_hub
-scipy>=1.11
+# Direct dependencies of the v4 worker (exact pins). requirements.lock is the full transitive set and is what the Dockerfile installs.
+# NOT listed here, installed by the Dockerfile from pinned sources (see pinned/pins.py): torch / torchaudio (2.7.1, cu128), resemble-perth (git commit), chatterbox-tts (git commit, --no-deps).
+runpod==1.12.0
+soundfile==0.14.0
+numpy==1.26.4
+scipy==1.17.1
+huggingface_hub==1.33.0
+# Chatterbox runtime dependencies, as declared by chatterbox-tts 0.1.7 (gradio is not needed to serve; its torch==2.6.0 / torchaudio==2.6.0 pins are intentionally not honoured: see docs/V4_PINNING.md)
+transformers==5.2.0
+diffusers==0.29.0
+safetensors==0.5.3
+librosa==0.11.0
+conformer==0.3.2
+pykakasi==2.3.0
+s3tokenizer==0.3.0
