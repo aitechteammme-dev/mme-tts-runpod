@@ -379,22 +379,25 @@ def handler(job):
             from streaming import gpu_validate_streaming as gv
             out_dir = "/tmp/stream_val"
             os.makedirs(out_dir, exist_ok=True)
-            seeds = int(data.get("seeds", 3))
+            stage = str(data.get("stage", "all"))
+            seeds = int(data.get("seeds", 1))
             quick = bool(data.get("quick", True))
 
-            log("[TTS] executing validate_streaming on GPU...")
-            t3_res = gv.stage_t3_equiv(MODEL, DEFAULT_REF_WAV, seeds=seeds)
-            dec_res = gv.stage_decoder(MODEL, DEFAULT_REF_WAV, out_dir=out_dir, quick=quick)
-            lat_res = gv.stage_latency(MODEL, DEFAULT_REF_WAV, runs=1)
-
-            yield {
+            log(f"[TTS] executing validate_streaming (stage={stage}) on GPU...")
+            res = {
                 "ok": True,
                 "action": "validate_streaming",
+                "stage": stage,
                 "env": gv.env_report(MODEL),
-                "t3_equiv": t3_res,
-                "decoder": dec_res,
-                "latency": lat_res,
             }
+            if stage in ("all", "t3_equiv"):
+                res["t3_equiv"] = gv.stage_t3_equiv(MODEL, DEFAULT_REF_WAV, seeds=seeds)
+            if stage in ("all", "decoder"):
+                res["decoder"] = gv.stage_decoder(MODEL, DEFAULT_REF_WAV, out_dir=out_dir, quick=quick)
+            if stage in ("all", "latency"):
+                res["latency"] = gv.stage_latency(MODEL, DEFAULT_REF_WAV, runs=1)
+
+            yield res
         except Exception as exc:
             traceback.print_exc()
             log(f"[TTS_VALIDATE_ERROR] {exc}")

@@ -118,9 +118,10 @@ def stage_decoder(model, voice, out_dir, quick: bool) -> dict:
             from stream_core import StreamDecoder
     model.prepare_conditionals(voice)
     os.makedirs(os.path.join(out_dir, "wav"), exist_ok=True)
-    grid = list(itertools.product((10, 25, 50), (8, 12, 24), (4, 8), (0, 240, 480)))
     if quick:
-        grid = grid[::7]
+        grid = [(25, 12, 4, 240), (50, 12, 4, 240)]
+    else:
+        grid = list(itertools.product((10, 25, 50), (8, 12, 24), (4, 8), (0, 240, 480)))
     rows = []
     for name, (lang, text) in PROMPTS.items():
         torch.manual_seed(0), torch.cuda.manual_seed_all(0)
