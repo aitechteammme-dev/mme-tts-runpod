@@ -64,9 +64,9 @@ def test_missing_input_is_an_error_not_a_crash(job):
     assert "error" in h.handler(job)
 
 
-def test_no_streaming_code_path_exists_in_the_handler():
+def test_streaming_code_path_exists_in_the_handler():
     src = (ROOT / "handler.py").read_text(encoding="utf-8")
-    assert not re.search(r"^\s*yield\b", src, re.M) and "return_aggregate_stream" not in src
+    assert re.search(r"^\s*yield\b", src, re.M) and "return_aggregate_stream" in src
 
 
 def test_lock_pins_are_exact_and_cover_requirements_txt():
