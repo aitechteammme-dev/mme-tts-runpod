@@ -383,7 +383,12 @@ def handler(job):
             seeds = int(data.get("seeds", 1))
             quick = bool(data.get("quick", True))
 
-            log(f"[TTS] executing validate_streaming (stage={stage}) on GPU...")
+            ref_voice = DEFAULT_REF_WAV if os.path.exists(DEFAULT_REF_WAV) else os.path.join(VOICES_DIR, f"{DEFAULT_VOICE}.wav")
+            if not os.path.exists(ref_voice):
+                wavs = glob.glob(os.path.join(VOICES_DIR, "*.wav"))
+                ref_voice = wavs[0] if wavs else DEFAULT_REF_WAV
+
+            log(f"[TTS] executing validate_streaming (stage={stage}, ref={ref_voice}) on GPU...")
             res = {
                 "ok": True,
                 "action": "validate_streaming",
@@ -391,11 +396,11 @@ def handler(job):
                 "env": gv.env_report(MODEL),
             }
             if stage in ("all", "t3_equiv"):
-                res["t3_equiv"] = gv.stage_t3_equiv(MODEL, DEFAULT_REF_WAV, seeds=seeds)
+                res["t3_equiv"] = gv.stage_t3_equiv(MODEL, ref_voice, seeds=seeds)
             if stage in ("all", "decoder"):
-                res["decoder"] = gv.stage_decoder(MODEL, DEFAULT_REF_WAV, out_dir=out_dir, quick=quick)
+                res["decoder"] = gv.stage_decoder(MODEL, ref_voice, out_dir=out_dir, quick=quick)
             if stage in ("all", "latency"):
-                res["latency"] = gv.stage_latency(MODEL, DEFAULT_REF_WAV, runs=1)
+                res["latency"] = gv.stage_latency(MODEL, ref_voice, runs=1)
 
             yield res
         except Exception as exc:

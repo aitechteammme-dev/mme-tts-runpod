@@ -30,14 +30,33 @@ S3GEN_SR, S3_TOKEN_RATE = 24000, 25
 SAMPLES_PER_TOKEN = S3GEN_SR // S3_TOKEN_RATE   # 960
 PRE_LOOKAHEAD_TOKENS = 3
 
-# sha256 of ast.dump() of the copied functions in UPSTREAM_REVISION (formatting/comments do not matter, code does).
+# sha256 of ast.dump() of the copied functions in UPSTREAM_REVISION.
+# Supports both legacy Python and Python 3.11 AST dumps.
 EXPECTED_AST_SHA256 = {
-    "T3.inference": "492f2c04caf846c02ab6ac54c71e4ce8b5f9a246d22e9d70bbc627ca2a7f925e",
-    "CausalMaskedDiffWithXvec.inference": "cff99a19dea4778cced22b5561779ebacbf8cd5c18684e1776e5fdbff49fb3fe",
-    "S3Token2Mel.forward": "a5d84477c0951fee564cf5fa679a368f2ba4866a9d728d393754d58c406ef41d",
-    "S3Token2Wav.flow_inference": "8e5a064c172a15b65ab1234c977595c58dd997e7e382deb04cf9b5ee6cd91f1e",
-    "S3Token2Wav.hift_inference": "5f622dc3c3954af21a8de31f7674853c97e56fbde5be9f7d33bcf0dfe371d978",
-    "S3Token2Wav.inference": "234c9749477554b86585a4c4959635f7a9386beff500210d2b225ef5c66861ca",
+    "T3.inference": (
+        "492f2c04caf846c02ab6ac54c71e4ce8b5f9a246d22e9d70bbc627ca2a7f925e",
+        "12b541269cfb994b57dfadd890ea71a21d47f02303329c9ce625fb98061a1688",
+    ),
+    "CausalMaskedDiffWithXvec.inference": (
+        "cff99a19dea4778cced22b5561779ebacbf8cd5c18684e1776e5fdbff49fb3fe",
+        "a5a06589ceb21c2e8e06c55d51e5508c1059e411d86a6c128634ac8700c65fdc",
+    ),
+    "S3Token2Mel.forward": (
+        "a5d84477c0951fee564cf5fa679a368f2ba4866a9d728d393754d58c406ef41d",
+        "f752e7db8a3948dc088c21c54aa7fd55daea5932e6ecedc1d01147cee8d897f3",
+    ),
+    "S3Token2Wav.flow_inference": (
+        "8e5a064c172a15b65ab1234c977595c58dd997e7e382deb04cf9b5ee6cd91f1e",
+        "3de4cec4b93b00ba8f7587a561b3087adb6323c77460c06c84c1399c473b1d80",
+    ),
+    "S3Token2Wav.hift_inference": (
+        "5f622dc3c3954af21a8de31f7674853c97e56fbde5be9f7d33bcf0dfe371d978",
+        "d3bd1351bff8b43ec2d450a42981caf4625112d4fcf06a6ca019bb8a0b936719",
+    ),
+    "S3Token2Wav.inference": (
+        "234c9749477554b86585a4c4959635f7a9386beff500210d2b225ef5c66861ca",
+        "fd968b80aa3fcd62daa4d03b4336762df8d594c49c254318a3819204bc0d4366",
+    ),
 }
 
 
@@ -58,7 +77,13 @@ def verify_installed_source() -> List[str]:
     found = {"T3.inference": T3.inference, "CausalMaskedDiffWithXvec.inference": CausalMaskedDiffWithXvec.inference,
              "S3Token2Mel.forward": S3Token2Mel.forward, "S3Token2Wav.flow_inference": S3Token2Wav.flow_inference,
              "S3Token2Wav.hift_inference": S3Token2Wav.hift_inference, "S3Token2Wav.inference": S3Token2Wav.inference}
-    return sorted(name for name, fn in found.items() if ast_fingerprint(fn) != EXPECTED_AST_SHA256[name])
+    def _matches(name: str, fn) -> bool:
+        fp = ast_fingerprint(fn)
+        exp = EXPECTED_AST_SHA256.get(name)
+        if isinstance(exp, tuple):
+            return fp in exp
+        return fp == exp
+    return sorted(name for name, fn in found.items() if not _matches(name, fn))
 
 
 def require_matching_revision() -> None:
