@@ -65,6 +65,7 @@ COPY ref_voice.wav /app/ref_voice.wav
 
 ENV DEFAULT_REF_WAV=/app/ref_voice.wav
 
+COPY streaming/ /app/streaming/
 COPY handler.py .
 
 CMD ["python", "-u", "handler.py"]

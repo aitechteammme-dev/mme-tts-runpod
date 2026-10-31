@@ -17,6 +17,7 @@ import base64
 import contextlib
 import copy
 import glob
+import inspect
 import io
 import json
 import os
@@ -58,8 +59,97 @@ ALLOWED_LANGUAGES = {
     "pl", "pt", "ru", "sv", "sw", "tr", "zh",
 }
 
+# ---------------------------------------------------------------------------------------------------------- speaking pace (language-specific)
+# Chatterbox has no speaking-rate control (the `exaggeration` / `cfg_weight` / `temperature` knobs change delivery, not a rate), so the pace is set AFTER synthesis by a pitch-preserving time-stretch of the
+# finished waveform (WSOLA: overlap-add of waveform segments aligned by cross-correlation; the sample rate and the voice's pitch are untouched; no sample-rate resampling). Speed 1.0 = the audio is returned untouched
+# (the same array), which is what Hindi gets by default. speed < 1 slows the speech down (0.85 = 17.6 % longer). Configure per language with the environment variables below; an invalid value is ignored (logged) and 1.0 is used.
+PACE_MIN, PACE_MAX = 0.5, 1.5
+PACE_DEFAULTS = {"en": 0.85, "hi": 1.0, "other": 1.0}
+PACE_ENV = {"en": "TTS_SPEED_EN", "hi": "TTS_SPEED_HI", "other": "TTS_SPEED_OTHER"}
+_ENGLISH_NAMES = {"en", "eng", "english"}
+_HINDI_NAMES = {"hi", "hin", "hindi", "hinglish"}      # Hinglish text is synthesized as Hindi (the client tags it `hi`): it is never slowed down as English
+STRETCH_FRAME_S, STRETCH_TOL_S = 0.030, 0.010          # WSOLA segment length and alignment search radius
+
+
+def pace_language(language) -> str:
+    """The pace class of a language tag: 'en' for English however it is written (en, EN, english, en-US, en_GB), 'hi' for Hindi/Hinglish, else the lower-case primary subtag ('' when missing)."""
+    s = str(language or "").strip().lower().replace("_", "-")
+    primary = s.split("-")[0]
+    if primary in _ENGLISH_NAMES:
+        return "en"
+    if primary in _HINDI_NAMES:
+        return "hi"
+    return primary
+
+
+def parse_speed(raw, default: float, name: str = "speed", warn=None) -> float:
+    """A speed from configuration. Unset/empty -> `default`. Not a number, not finite or outside [PACE_MIN, PACE_MAX] -> 1.0 (no processing) and a warning: a bad setting never crashes the worker."""
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        v = float(str(raw).strip())
+    except ValueError:
+        v = float("nan")
+    if not (np.isfinite(v) and PACE_MIN <= v <= PACE_MAX):
+        if warn:
+            warn(f"[TTS] WARNING: {name}={raw!r} is not a number in [{PACE_MIN}, {PACE_MAX}]: using 1.0 (no time-stretch)")
+        return 1.0
+    return v
+
+
+def load_pace_config(env, warn=None) -> dict:
+    return {k: parse_speed(env.get(PACE_ENV[k]), PACE_DEFAULTS[k], PACE_ENV[k], warn) for k in PACE_DEFAULTS}
+
+
+def pace_speed(language, pace=None) -> float:
+    """The configured speed for a language tag. English variants share one setting; Hindi/Hinglish have their own; missing or unknown languages use the 'other' setting (1.0 by default)."""
+    pace = PACE if pace is None else pace
+    k = pace_language(language)
+    return pace["en"] if k == "en" else pace["hi"] if k == "hi" else pace["other"]
+
+
+def time_stretch(audio, sr: int, speed: float):
+    """Pitch-preserving time-stretch by WSOLA. Returns float32 audio of about len(audio) / speed samples at the SAME sample rate. Returned UNCHANGED (same array) for speed 1.0 or an invalid speed, empty audio, and clips
+    shorter than three segments (90 ms: too short to stretch cleanly). All-zero audio gives silence of the stretched length. Non-finite samples are replaced by 0. Pure numpy, no JIT, no new dependency."""
+    x = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if x.size == 0 or not np.isfinite(speed) or speed <= 0 or abs(speed - 1.0) < 1e-3:
+        return audio
+    frame = int(round(STRETCH_FRAME_S * sr)) // 2 * 2
+    hop, tol = frame // 2, int(round(STRETCH_TOL_S * sr))
+    if x.size < 3 * frame:
+        return audio
+    if not np.isfinite(x).all():
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    n_out = int(round(x.size / speed))
+    if not x.any():
+        return np.zeros(n_out, dtype=np.float32)
+    win = np.hanning(frame + 1)[:-1].astype(np.float32)           # periodic Hann: neighbouring segments at 50 % overlap sum to exactly 1
+    win0 = win.copy()
+    win0[:hop] = 1.0                                              # no fade-in on the very first segment
+    xp = np.concatenate([np.zeros(tol, np.float32), x, np.zeros(frame + 2 * tol + hop, np.float32)])    # index i of x is index i + tol of xp
+    n_frames = -(-n_out // hop)
+    out = np.zeros(n_frames * hop + frame, dtype=np.float32)
+    out[:frame] += xp[tol:tol + frame] * win0
+    prev = 0
+    for k in range(1, n_frames + 1):
+        target = int(round(k * hop * speed))
+        nat = prev + hop                                          # where the previous segment would naturally continue
+        template = xp[nat + tol:nat + tol + frame]
+        lo = target - tol
+        search = xp[lo + tol:lo + tol + 2 * tol + frame]
+        corr = np.correlate(search, template, mode="valid")       # similarity of every candidate start in [target - tol, target + tol]
+        cs = np.concatenate([[0.0], np.cumsum(search.astype(np.float64) ** 2)])
+        energy = cs[frame:frame + 2 * tol + 1] - cs[:2 * tol + 1]
+        p = lo + int(np.argmax(corr / np.sqrt(energy + 1e-9)))
+        out[k * hop:k * hop + frame] += xp[p + tol:p + tol + frame] * win
+        prev = p
+    return np.clip(out[:n_out], -1.0, 1.0).astype(np.float32)
+
+
+PACE = load_pace_config(os.environ, warn=lambda m: print(m, flush=True))
+
 GEN_LOCK = threading.Lock()
-MODEL = None            # the Chatterbox model (a fake one in --self-test)
+MODEL = None           # the Chatterbox model (a fake one in --self-test)
 _torch = None           # set by load_model(); None means "no torch": generate_audio then uses the model's output as it is (self-test)
 VOICES = {}             # voice name -> prepared conditionals, built ONCE per worker at start-up
 _active_voice = None
@@ -187,7 +277,7 @@ class _Profiler:
         parts = sum(d.get(k, 0.0) for k in ("tokenize_s", "t3_s", "flow_s", "hift_s", "watermark_s"))
         if "model_generate_s" in d:
             d["model_generate_other_s"] = max(0.0, d["model_generate_s"] - parts)
-        known = sum(d.get(k, 0.0) for k in ("validate_s", "lock_wait_s", "select_voice_s", "model_generate_s", "sync_and_host_copy_s", "encode_s"))
+        known = sum(d.get(k, 0.0) for k in ("validate_s", "lock_wait_s", "select_voice_s", "model_generate_s", "sync_and_host_copy_s", "stretch_s", "encode_s"))
         d["handler_unattributed_s"] = max(0.0, total_s - known)
         if d.get("speech_tokens") and d.get("t3_s") is not None:
             d["t3_ms_per_token"] = 1000.0 * d["t3_s"] / d["speech_tokens"]
@@ -280,35 +370,85 @@ def handler(job):
 
     # Cheap ping so your server can pre-warm without synthesizing anything
     if data.get("warmup"):
-        return {"ok": True}
+        yield {"ok": True}
+        return
+
+    # Diagnostic streaming validation action
+    if data.get("action") == "validate_streaming":
+        try:
+            from streaming import gpu_validate_streaming as gv
+            out_dir = "/tmp/stream_val"
+            os.makedirs(out_dir, exist_ok=True)
+            seeds = int(data.get("seeds", 3))
+            quick = bool(data.get("quick", True))
+
+            log("[TTS] executing validate_streaming on GPU...")
+            t3_res = gv.stage_t3_equiv(MODEL, DEFAULT_REF_WAV, seeds=seeds)
+            dec_res = gv.stage_decoder(MODEL, DEFAULT_REF_WAV, out_dir=out_dir, quick=quick)
+            lat_res = gv.stage_latency(MODEL, DEFAULT_REF_WAV, runs=1)
+
+            yield {
+                "ok": True,
+                "action": "validate_streaming",
+                "env": gv.env_report(MODEL),
+                "t3_equiv": t3_res,
+                "decoder": dec_res,
+                "latency": lat_res,
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            log(f"[TTS_VALIDATE_ERROR] {exc}")
+            yield {"error": f"validate_streaming_failed: {exc}"}
+        return
+
+    # Streamed audio (checks watermarking policy gate)
+    if data.get("stream"):
+        allow_unw = os.getenv("ALLOW_UNWATERMARKED_STREAMING", "0") == "1" or data.get("allow_unwatermarked") is True
+        if not allow_unw:
+            refusal = pinned_runtime.streaming_refusal()
+            yield refusal if refusal else {
+                "seq": 0,
+                "error": "streaming_disabled",
+                "detail": "Streamed audio cannot carry Perth watermark. Set ALLOW_UNWATERMARKED_STREAMING=1",
+                "final": True
+            }
+            return
+
+        try:
+            from streaming.handler_stream import handler_stream_generator
+            yield from handler_stream_generator(job, MODEL, VOICES, DEFAULT_VOICE, gen_lock=GEN_LOCK)
+        except Exception as exc:
+            traceback.print_exc()
+            log(f"[TTS_STREAM_ERROR] {exc}")
+            yield {"seq": 0, "error": f"streaming_failed: {type(exc).__name__}: {exc}", "final": True}
+        return
 
     total_start = time.perf_counter()
     _P.begin()
 
-    # Streamed audio would not be watermarked (Perth is applied to the finished waveform only): refuse, emit no audio.
-    if data.get("stream"):
-        refusal = pinned_runtime.streaming_refusal()
-        if refusal:
-            return refusal
-
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
-        return {"error": "Provide a non-empty input.text"}
+        yield {"error": "Provide a non-empty input.text"}
+        return
     text = text.strip()[:MAX_TEXT_CHARS]
 
     language = data.get("language", "hi")
     if language not in ALLOWED_LANGUAGES:
-        return {"error": f"Unsupported language: {language}"}
+        yield {"error": f"Unsupported language: {language}"}
+        return
 
     output_format = data.get("output_format", "wav")  # "wav" (default), "pcm16" (model rate) or "ulaw8k" (8 kHz mu-law)
     if output_format not in OUTPUT_FORMATS:
-        return {"error": "output_format must be 'wav', 'pcm16' or 'ulaw8k'"}
+        yield {"error": "output_format must be 'wav', 'pcm16' or 'ulaw8k'"}
+        return
     if output_format == "ulaw8k" and MODEL.sr % 8000:
-        return {"error": f"ulaw8k needs a model rate that is a multiple of 8000 (got {MODEL.sr})"}
+        yield {"error": f"ulaw8k needs a model rate that is a multiple of 8000 (got {MODEL.sr})"}
+        return
 
     voice = data.get("voice", DEFAULT_VOICE)
     if voice not in VOICES and not (ALLOW_REQUEST_REF and data.get("reference_audio_base64")):
-        return {"error": f"Unknown voice: {voice!r}", "voices": sorted(VOICES)}
+        yield {"error": f"Unknown voice: {voice!r}", "voices": sorted(VOICES)}
+        return
 
     # Optional generation knobs (only passed when provided)
     gen_kwargs = {}
@@ -326,7 +466,8 @@ def handler(job):
             if ref_b64:   # legacy path (off by default): a voice sent in the request is prepared on EVERY such request (slow)
                 ref_bytes = base64.b64decode(ref_b64, validate=True)
                 if len(ref_bytes) > MAX_REF_BYTES:
-                    return {"error": "Reference audio must be 15 MB or smaller"}
+                    yield {"error": "Reference audio must be 15 MB or smaller"}
+                    return
                 with tempfile.NamedTemporaryFile(suffix=".wav") as f:
                     f.write(ref_bytes)
                     f.flush()
@@ -340,18 +481,36 @@ def handler(job):
             audio = generate_audio(text, language, **gen_kwargs)
             generate_s = time.perf_counter() - t0
 
+        # Pace (outside GEN_LOCK: CPU work must not hold up the GPU). The synthesized waveform is measured BEFORE it is touched and kept as audio_raw; a failure here falls back to it.
+        audio_raw = audio
+        raw_audio_s = len(audio_raw) / MODEL.sr
+        speed = pace_speed(language)
+        stretch_s, raw_peak, raw_rms = 0.0, 0.0, 0.0
+        if speed != 1.0 and len(audio_raw):
+            raw_peak, raw_rms = float(np.max(np.abs(audio_raw))), float(np.sqrt(np.mean(np.square(audio_raw, dtype=np.float64))))
+            t0 = time.perf_counter()
+            try:
+                audio = time_stretch(audio_raw, MODEL.sr, speed)
+            except Exception as exc:                 # noqa: BLE001: pace is cosmetic, the request must still be answered with the original audio
+                traceback.print_exc()
+                log(f"[TTS_PACE_ERROR] {type(exc).__name__}: {exc}: sending the unstretched audio")
+                audio, speed = audio_raw, 1.0
+            stretch_s = time.perf_counter() - t0
+        _P.rec("stretch_s", stretch_s)
+
         t0 = time.perf_counter()
         audio_b64 = encode_audio(audio, MODEL.sr, output_format)
         encode_s = time.perf_counter() - t0
         _P.rec("encode_s", encode_s)
 
-        audio_s = len(audio) / MODEL.sr
+        audio_s = len(audio) / MODEL.sr                  # the audio actually returned
         total_s = time.perf_counter() - total_start
         log(
             "[TTS_TIMING] "
             f"chars={len(text)} audio_s={audio_s:.2f} ref_s={ref_s:.3f} voice={voice} "
             f"generate_s={generate_s:.3f} encode_s={encode_s:.3f} "
-            f"total_s={total_s:.3f} rtf={generate_s / max(audio_s, 1e-6):.2f} fmt={output_format}"
+            f"total_s={total_s:.3f} rtf={generate_s / max(raw_audio_s, 1e-6):.2f} fmt={output_format} "
+            f"speed={speed:.2f} raw_audio_s={raw_audio_s:.2f} stretch_s={stretch_s:.3f}"
         )
 
         response = {
@@ -366,16 +525,17 @@ def handler(job):
                 "audio_s": round(audio_s, 3),
             },
         }
-        detail = _P.snapshot(total_s, {"chars": len(text), "audio_s": round(audio_s, 3), "output_format": output_format, "response_base64_chars": len(audio_b64)})
+        detail = _P.snapshot(total_s, {"chars": len(text), "audio_s": round(audio_s, 3), "output_format": output_format, "response_base64_chars": len(audio_b64),
+                                       "speed": speed, "raw_audio_s": round(raw_audio_s, 3), "raw_peak": round(raw_peak, 4), "raw_rms": round(raw_rms, 4)})
         if detail is not None:       # only with V4_PROFILE=1: an extra field, the audio and the baseline fields are unchanged
             response["timing_detail"] = detail
             log("[TTS_PROFILE] " + json.dumps(detail, sort_keys=True))
-        return response
+        yield response
 
     except Exception as exc:
         traceback.print_exc()
         log(f"[TTS_ERROR] {exc}")
-        return {"error": str(exc), "type": type(exc).__name__}
+        yield {"error": str(exc), "type": type(exc).__name__}
 
 
 # ---------------------------------------------------------------------------------------------------------- self-test (no GPU)
@@ -384,6 +544,15 @@ def run_self_test() -> int:
     model. Needs numpy, scipy and soundfile only: no torch, no chatterbox, no GPU, no network. Exit code 0 = all passed."""
     global MODEL, _torch, VOICES, _active_voice, DEFAULT_REF_WAV, DEFAULT_VOICE, VOICES_DIR, ALLOW_REQUEST_REF, log
     results, lines = [], []
+
+    _real_handler = globals()["handler"]
+
+    def handler(job):
+        res = _real_handler(job)
+        if inspect.isgenerator(res):
+            items = list(res)
+            return items[0] if items else {}
+        return res
 
     def check(name, ok, detail=""):
         results.append(bool(ok))
@@ -586,9 +755,10 @@ def main() -> int:
     warm_up()
     if PROFILE:    # after verification and warm-up, so the checked model is the one that gets wrapped, and the warm-up is not recorded
         install_profiling(MODEL, _torch)
+    log(f"[TTS] pace: en={PACE['en']:.2f} hi={PACE['hi']:.2f} other={PACE['other']:.2f} (pitch-preserving time-stretch after synthesis; 1.00 = untouched)")
     log(f"[TTS] ready: voices={sorted(VOICES)} default={DEFAULT_VOICE} sample_rate={MODEL.sr} formats={','.join(OUTPUT_FORMATS)} "
         f"request_reference={'allowed' if ALLOW_REQUEST_REF else 'ignored'}")
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
     return 0
 
 
