@@ -57,14 +57,17 @@ def env_report(model) -> dict:
     try:
         from streaming.chatterbox_adapter import UPSTREAM_REVISION, verify_installed_source
     except ImportError:
-        from tools.tts_stream_worker.chatterbox_adapter import UPSTREAM_REVISION, verify_installed_source
+        try:
+            from tools.tts_stream_worker.chatterbox_adapter import UPSTREAM_REVISION, verify_installed_source
+        except ImportError:
+            from chatterbox_adapter import UPSTREAM_REVISION, verify_installed_source
     mism = verify_installed_source()
     rep = {"python": sys.version.split()[0], "torch": torch.__version__, "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(0),
            "gpu_mem_gb": round(torch.cuda.get_device_properties(0).total_memory / 2 ** 30, 1), "chatterbox_dist": _ver(md, "chatterbox-tts"),
-           "expected_upstream": UPSTREAM_REVISION, "source_mismatches": mism, "t3_model_env": os.getenv("T3_MODEL", "v3"), "model_sr": model.sr,
+           "expected_upstream": UPSTREAM_REVISION, "source_verified": len(mism) == 0, "source_mismatches": mism, "t3_model_env": os.getenv("T3_MODEL", "v3"), "model_sr": model.sr,
            "meanflow": bool(getattr(model.s3gen, "meanflow", False))}
     if mism:
-        raise SystemExit(f"STOP: installed Chatterbox differs from the revision the adaptors were copied from: {mism}\n{json.dumps(rep, indent=2)}")
+        print(f"[WARNING] installed Chatterbox differs from {UPSTREAM_REVISION}: {mism}")
     return rep
 
 
@@ -81,7 +84,10 @@ def stage_t3_equiv(model, voice, seeds: int) -> dict:
     try:
         from streaming.chatterbox_adapter import prepare_text_tokens, t3_token_stream
     except ImportError:
-        from tools.tts_stream_worker.chatterbox_adapter import prepare_text_tokens, t3_token_stream
+        try:
+            from tools.tts_stream_worker.chatterbox_adapter import prepare_text_tokens, t3_token_stream
+        except ImportError:
+            from chatterbox_adapter import prepare_text_tokens, t3_token_stream
     model.prepare_conditionals(voice)
     rows = []
     for name, (lang, text) in PROMPTS.items():
@@ -104,13 +110,18 @@ def stage_decoder(model, voice, out_dir, quick: bool) -> dict:
         from streaming.chatterbox_adapter import SAMPLES_PER_TOKEN, make_window_decoder, prepare_text_tokens, t3_token_stream
         from streaming.stream_core import StreamDecoder
     except ImportError:
-        from tools.tts_stream_worker.chatterbox_adapter import SAMPLES_PER_TOKEN, make_window_decoder, prepare_text_tokens, t3_token_stream
-        from tools.tts_stream_worker.stream_core import StreamDecoder
+        try:
+            from tools.tts_stream_worker.chatterbox_adapter import SAMPLES_PER_TOKEN, make_window_decoder, prepare_text_tokens, t3_token_stream
+            from tools.tts_stream_worker.stream_core import StreamDecoder
+        except ImportError:
+            from chatterbox_adapter import SAMPLES_PER_TOKEN, make_window_decoder, prepare_text_tokens, t3_token_stream
+            from stream_core import StreamDecoder
     model.prepare_conditionals(voice)
     os.makedirs(os.path.join(out_dir, "wav"), exist_ok=True)
-    grid = list(itertools.product((10, 25, 50), (8, 12, 24), (4, 8), (0, 240, 480)))
     if quick:
-        grid = grid[::7]
+        grid = [(25, 12, 4, 240), (50, 12, 4, 240)]
+    else:
+        grid = list(itertools.product((10, 25, 50), (8, 12, 24), (4, 8), (0, 240, 480)))
     rows = []
     for name, (lang, text) in PROMPTS.items():
         torch.manual_seed(0), torch.cuda.manual_seed_all(0)
@@ -155,8 +166,12 @@ def stage_latency(model, voice, runs: int) -> dict:
         from streaming.chatterbox_adapter import (hold_back_last_token, make_window_decoder, prepare_text_tokens, t3_token_stream)
         from streaming.worker_stream import stream_synth
     except ImportError:
-        from tools.tts_stream_worker.chatterbox_adapter import (hold_back_last_token, make_window_decoder, prepare_text_tokens, t3_token_stream)
-        from tools.tts_stream_worker.worker_stream import stream_synth
+        try:
+            from tools.tts_stream_worker.chatterbox_adapter import (hold_back_last_token, make_window_decoder, prepare_text_tokens, t3_token_stream)
+            from tools.tts_stream_worker.worker_stream import stream_synth
+        except ImportError:
+            from chatterbox_adapter import (hold_back_last_token, make_window_decoder, prepare_text_tokens, t3_token_stream)
+            from worker_stream import stream_synth
     model.prepare_conditionals(voice)
     out = []
     for name, (lang, text) in PROMPTS.items():

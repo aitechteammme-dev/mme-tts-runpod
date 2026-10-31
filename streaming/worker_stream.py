@@ -16,7 +16,13 @@ from typing import Callable, Iterator, Optional
 
 import numpy as np
 
-from tools.tts_stream_worker.stream_core import StreamDecoder
+try:
+    from streaming.stream_core import StreamDecoder
+except ImportError:
+    try:
+        from tools.tts_stream_worker.stream_core import StreamDecoder
+    except ImportError:
+        from stream_core import StreamDecoder
 
 
 class StreamingDecimator:
